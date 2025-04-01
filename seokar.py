@@ -1,37 +1,38 @@
-import logging
-from typing import Dict, List, Tuple, Optional, Any
-from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Updater,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    Filters,
-    CallbackContext,
-    Dispatcher,
-    JobQueue
-)
-from transformers import pipeline, AutoModelForSeq2SeqLM, AutoTokenizer
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-import re
 import json
+import logging
 import os
-from pathlib import Path
+import re
+import time
 from dataclasses import dataclass, field
-import hashlib
+from datetime import datetime, timedelta
 from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+import hashlib
+import numpy as np
+import pytz
+import requests
+from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet
 from googletrans import Translator
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-import pytz
-from bs4 import BeautifulSoup
-import requests
-from urllib.parse import urlparse
-import time
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    CallbackContext,
+    CallbackQueryHandler,
+    CommandHandler,
+    Dispatcher,
+    Filters,
+    JobQueue,
+    MessageHandler,
+    Updater,
+)
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
 
 # تنظیمات پایه
 logging.basicConfig(
@@ -40,8 +41,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== کلاس‌های کمکی و پیکربندی ====================
 
+# ==================== کلاس‌های کمکی و پیکربندی ====================
 @dataclass
 class SubscriptionPlan:
     name: str
@@ -51,6 +52,7 @@ class SubscriptionPlan:
     max_content_length: int
     advanced_analytics: bool
     api_access: bool
+
 
 @dataclass
 class Config:
@@ -90,6 +92,7 @@ class Config:
             100, 15000, True, True
         )
     })
+
 
 class SEOAnalytics:
     """کلاس برای تحلیل محتوای سئو با الگوریتم‌های پیشرفته"""
@@ -147,6 +150,7 @@ class SEOAnalytics:
             'h1': [h1.text for h1 in soup.find_all('h1')],
             'h2': [h2.text for h2 in soup.find_all('h2')]
         }
+
 
 class ModelManager:
     """مدیریت هوشمند مدل‌های یادگیری ماشین با بهینه‌سازی حافظه"""
@@ -254,6 +258,7 @@ class ModelManager:
         logger.info(f"مدل ترجمه در {load_time:.2f} ثانیه بارگذاری شد")
         return model
 
+
 class SecurityManager:
     """مدیریت امنیت و رمزنگاری داده‌ها"""
     
@@ -271,6 +276,7 @@ class SecurityManager:
     def hash_data(self, data: str) -> str:
         """هش کردن داده‌ها"""
         return hashlib.sha256(data.encode()).hexdigest()
+
 
 class PaymentManager:
     """مدیریت سیستم پرداخت و اشتراک‌ها"""
@@ -297,6 +303,7 @@ class PaymentManager:
             f"📊 محدودیت استفاده: {plan.rate_limit} درخواست در ساعت"
         )
 
+
 class LanguageManager:
     """مدیریت چندزبانه و ترجمه"""
     
@@ -319,6 +326,7 @@ class LanguageManager:
         except Exception as e:
             logger.error(f"خطا در ترجمه متن: {e}")
             return text
+
 
 class BackupManager:
     """مدیریت پشتیبان‌گیری و بازیابی داده‌ها"""
@@ -350,6 +358,7 @@ class BackupManager:
         except Exception as e:
             logger.error(f"خطا در بازیابی پشتیبان: {e}")
             return None
+
 
 class ReportGenerator:
     """تولید گزارش‌های حرفه‌ای"""
@@ -397,6 +406,7 @@ class ReportGenerator:
             logger.error(f"خطا در تولید گزارش: {e}")
             return False
 
+
 class GoogleIntegration:
     """ادغام با سرویس‌های گوگل"""
     
@@ -421,6 +431,7 @@ class GoogleIntegration:
         except Exception as e:
             logger.error(f"خطا در دریافت داده‌های سرچ کنسول: {e}")
             return None
+
     def get_analytics_data(self, view_id: str) -> Optional[Dict]:
         """دریافت داده‌های گوگل آنالیتیکس"""
         try:
@@ -440,6 +451,7 @@ class GoogleIntegration:
         except Exception as e:
             logger.error(f"خطا در دریافت داده‌های آنالیتیکس: {e}")
             return None
+
 
 class CompetitorAnalyzer:
     """تحلیل و مقایسه رقبا"""
@@ -511,6 +523,7 @@ class CompetitorAnalyzer:
         
         return suggestions
 
+
 class UserProfile:
     """مدیریت پروفایل و تنظیمات کاربر"""
     
@@ -573,6 +586,7 @@ class UserProfile:
         if content_id:
             return [item for item in self.data["saved_content"] if item["id"] == content_id]
         return self.data["saved_content"]
+
 
 class SEOAssistantBot:
     """ربات هوشمند سئوکار با قابلیت‌های پیشرفته تحلیل و بهینه‌سازی"""
