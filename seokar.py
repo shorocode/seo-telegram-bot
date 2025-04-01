@@ -848,8 +848,7 @@ class SEOAssistantBot:
 - مثال: `/analyze https://example.com`
 
 🔄 *مقایسه دو متن*
-/compare [متن
-  1]\n[متن2]
+/compare [متن1]\n[متن2]
 - مقایسه شباهت و کیفیت دو متن
 - مثال: `/compare متن اول...\nمتن دوم...`
 
@@ -875,6 +874,7 @@ class SEOAssistantBot:
 /stats - آمار سیستم
 
 برای شروع از /menu استفاده کنید یا یکی از دستورات بالا را وارد کنید
+"""
         update.message.reply_text(help_text, parse_mode="Markdown")
 
     def show_main_menu(self, update: Update, context: CallbackContext):
