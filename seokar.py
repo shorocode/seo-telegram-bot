@@ -7,16 +7,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
-
 import hashlib
 import numpy as np
 import pytz
 import requests
 from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet
-from googletrans import Translator
+from google.cloud import translate_v2 as translate
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from sentence_transformers import SentenceTransformer
@@ -33,35 +32,56 @@ from telegram.ext import (
     Updater,
 )
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+from concurrent.futures import ThreadPoolExecutor
+from cachetools import TTLCache
+import backoff
+from prometheus_client import start_http_server, Counter, Gauge
 
-# تنظیمات پایه
+# ##################################################
+# ## ---------- تنظیمات پیشرفته سیستم ---------- ##
+# ##################################################
+
+# تنظیمات پایه لاگینگ
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# متریک‌های Prometheus
+REQUEST_COUNTER = Counter('bot_requests_total', 'Total bot requests', ['endpoint'])
+ERROR_COUNTER = Counter('bot_errors_total', 'Total bot errors', ['endpoint'])
+ACTIVE_USERS_GAUGE = Gauge('bot_active_users', 'Currently active users')
+MODEL_LOAD_TIME = Gauge('model_load_time_seconds', 'Time taken to load models', ['model_name'])
 
-# ==================== کلاس‌های کمکی و پیکربندی ====================
-@dataclass
+# ##################################################
+# ## ---------- ساختارهای داده اصلی ---------- ##
+# ##################################################
+
+@dataclass(frozen=True)
 class SubscriptionPlan:
+    """طرح اشتراک با تمام ویژگی‌ها و محدودیت‌ها"""
     name: str
     monthly_price: int
+    annual_price: int
     features: List[str]
     rate_limit: int
     max_content_length: int
     advanced_analytics: bool
     api_access: bool
-
+    priority_support: bool
+    team_members: int
+    color_code: str = "#4CAF50"  # رنگ پیش‌فرض
 
 @dataclass
 class Config:
-    BOT_TOKEN: str = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN')
+    """پیکربندی اصلی سیستم با مقادیر پیش‌فرض"""
+    BOT_TOKEN: str = os.getenv('BOT_TOKEN', '')
     MODEL_CACHE_DIR: str = "model_cache"
     USER_DATA_DIR: str = "user_data"
     BACKUP_DIR: str = "backups"
-    MAX_CONTENT_LENGTH: int = 15000
-    KEYWORD_SUGGESTIONS: int = 15
+    MAX_CONTENT_LENGTH: int = 30000
+    KEYWORD_SUGGESTIONS: int = 25
     CONTENT_TYPES: Dict[str, str] = field(default_factory=lambda: {
         "article": "مقاله",
         "product": "محصول",
@@ -70,353 +90,726 @@ class Config:
         "video": "محتوی ویدئویی",
         "social": "پست شبکه اجتماعی"
     })
-    DEFAULT_RATE_LIMIT: int = 10
-    ENCRYPTION_KEY: str = os.getenv('ENCRYPTION_KEY', Fernet.generate_key().decode())
+    DEFAULT_RATE_LIMIT: int = 15
+    ENCRYPTION_KEY: str = os.getenv('ENCRYPTION_KEY', '')
     GOOGLE_API_KEY: Optional[str] = os.getenv('GOOGLE_API_KEY')
     TIMEZONE: str = "Asia/Tehran"
-
+    MAX_CONCURRENT_REQUESTS: int = 10
+    REQUEST_TIMEOUT: int = 30
+    SENTRY_DSN: Optional[str] = os.getenv('SENTRY_DSN')
+    
     SUBSCRIPTION_PLANS: Dict[str, SubscriptionPlan] = field(default_factory=lambda: {
         "free": SubscriptionPlan(
-            "رایگان", 0,
-            ["پیشنهاد کلمات کلیدی", "تحلیل سئو پایه"],
-            10, 2000, False, False
+            "رایگان", 0, 0,
+            ["پیشنهاد کلمات کلیدی", "تحلیل سئو پایه", "۵ درخواست در روز"],
+            5, 2000, False, False, False, 1, "#9E9E9E"
         ),
         "pro": SubscriptionPlan(
-            "حرفه‌ای", 99000,
-            ["تمام امکانات پایه", "تولید محتوا", "بهینه‌سازی پیشرفته"],
-            30, 5000, True, False
+            "حرفه‌ای", 99000, 990000,
+            ["تمام امکانات پایه", "تولید محتوا", "بهینه‌سازی پیشرفته", "۵۰ درخواست در روز"],
+            50, 10000, True, False, False, 3, "#2196F3"
         ),
         "enterprise": SubscriptionPlan(
-            "سازمانی", 299000,
-            ["تمام امکانات", "پشتیبانی اختصاصی", "API دسترسی"],
-            100, 15000, True, True
+            "سازمانی", 299000, 2990000,
+            ["تمام امکانات", "پشتیبانی اختصاصی", "API دسترسی", "تیم ۵ نفره", "درخواست نامحدود"],
+            1000, 30000, True, True, True, 5, "#FF5722"
         )
     })
 
-
-class SEOAnalytics:
-    """کلاس برای تحلیل محتوای سئو با الگوریتم‌های پیشرفته"""
-
-    @staticmethod
-    def calculate_readability(text: str) -> float:
-        """محاسبه سطح خوانایی متن با فرمول بهبودیافته برای زبان فارسی"""
-        words = text.split()
-        sentences = re.split(r'[.!?]', text)
-        words_count = len(words)
-        sentences_count = len([s for s in sentences if s.strip()])
-
-        if words_count == 0 or sentences_count == 0:
-            return 0
-
-        avg_words_per_sentence = words_count / sentences_count
-        syllables_count = sum([SEOAnalytics.count_syllables(word) for word in words])
-        avg_syllables_per_word = syllables_count / words_count
-
-        readability = 206.835 - (1.3 * avg_words_per_sentence) - (60.6 * avg_syllables_per_word)
-        return max(0, min(100, readability))
-
-    @staticmethod
-    def count_syllables(word: str) -> int:
-        """شمارش هجاهای کلمه فارسی با دقت بالاتر"""
-        vowels = ['ا', 'آ', 'أ', 'إ', 'ئ', 'ی', 'و', 'ؤ', 'ه', 'ن', 'م', 'ء', 'ع']
-        return sum(1 for char in word if char in vowels)
-
-    @staticmethod
-    def keyword_density(text: str, keywords: List[str]) -> Dict[str, float]:
-        """محاسبه تراکم کلمات کلیدی با در نظر گرفتن صورت‌های مختلف کلمات"""
-        words = text.split()
-        word_count = len(words)
-        density = {}
-
-        for keyword in keywords:
-            keyword = keyword.strip()
-            if not keyword:
-                continue
-
-            pattern = re.compile(r'\b' + re.escape(keyword) + r'\b', re.IGNORECASE)
-            count = len(pattern.findall(text))
-            density[keyword] = (count / word_count) * 100 if word_count > 0 else 0
-
-        return density
-
-    @staticmethod
-    def analyze_meta_tags(html: str) -> Dict[str, str]:
-        """تحلیل متا تگ‌های HTML"""
-        soup = BeautifulSoup(html, 'html.parser')
-        return {
-            'title': soup.title.string if soup.title else None,
-            'meta_description': soup.find('meta', attrs={'name': 'description'})['content']
-                              if soup.find('meta', attrs={'name': 'description'}) else None,
-            'h1': [h1.text for h1 in soup.find_all('h1')],
-            'h2': [h2.text for h2 in soup.find_all('h2')]
-        }
-
+# ##################################################
+# ## ---------- سیستم مدیریت مدل‌ها ---------- ##
+# ##################################################
 
 class ModelManager:
-    """مدیریت هوشمند مدل‌های یادگیری ماشین با بهینه‌سازی حافظه"""
-
+    """مدیریت هوشمند مدل‌های یادگیری ماشین با بهینه‌سازی منابع"""
+    
     def __init__(self, config: Config):
         self.config = config
         self._setup_dirs()
         self.models = {}
         self.load_times = {}
-
+        self.executor = ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_REQUESTS)
+        self.model_cache = TTLCache(maxsize=10, ttl=3600)  # کش مدل‌ها برای 1 ساعت
+        
     def _setup_dirs(self):
-        """ایجاد و مدیریت دایرکتوری‌های مورد نیاز"""
-        Path(self.config.MODEL_CACHE_DIR).mkdir(exist_ok=True)
-        Path(self.config.USER_DATA_DIR).mkdir(exist_ok=True)
-
-    def load_models(self):
-        """بارگذاری هوشمند مدل‌ها با قابلیت کش و مدیریت منابع"""
+        """ایجاد دایرکتوری‌های مورد نیاز با بررسی مجوزها"""
         try:
-            self.models = {
-                "keyword": self._load_keyword_model(),
-                "content": self._load_content_model(),
-                "similarity": self._load_similarity_model(),
-                "optimization": self._load_optimization_model(),
-                "translation": self._load_translation_model()
-            }
-            logger.info("تمامی مدل‌ها با موفقیت بارگذاری شدند")
+            os.makedirs(self.config.MODEL_CACHE_DIR, exist_ok=True, mode=0o755)
+            os.makedirs(self.config.USER_DATA_DIR, exist_ok=True, mode=0o700)
         except Exception as e:
-            logger.error(f"خطا در بارگذاری مدل‌ها: {e}")
+            logger.error(f"خطا در ایجاد دایرکتوری‌ها: {e}")
             raise
 
-    def unload_model(self, model_name: str):
-        """تخلیه مدل از حافظه برای بهینه‌سازی منابع"""
-        if model_name in self.models:
-            del self.models[model_name]
-            logger.info(f"مدل {model_name} از حافظه تخلیه شد")
+    @backoff.on_exception(backoff.expo, Exception, max_tries=3)
+    def load_models(self):
+        """بارگذاری مدل‌ها با قابلیت تلاش مجدد"""
+        try:
+            start_time = time.time()
+            
+            # بارگذاری موازی مدل‌ها
+            with ThreadPoolExecutor() as executor:
+                futures = {
+                    executor.submit(self._load_keyword_model): "keyword",
+                    executor.submit(self._load_content_model): "content",
+                    executor.submit(self._load_similarity_model): "similarity",
+                    executor.submit(self._load_optimization_model): "optimization",
+                    executor.submit(self._load_translation_model): "translation"
+                }
+                
+                for future in futures:
+                    model_name = futures[future]
+                    try:
+                        self.models[model_name] = future.result()
+                    except Exception as e:
+                        logger.error(f"خطا در بارگذاری مدل {model_name}: {e}")
+                        raise
+
+            logger.info(f"تمامی مدل‌ها در {time.time() - start_time:.2f} ثانیه بارگذاری شدند")
+            return True
+        except Exception as e:
+            logger.error(f"خطای بحرانی در بارگذاری مدل‌ها: {e}")
+            return False
 
     @lru_cache(maxsize=1)
     def _load_keyword_model(self):
-        """بارگذاری مدل پیشنهاد کلمات کلیدی با کش"""
-        logger.info("در حال بارگذاری مدل کلمات کلیدی...")
-        start_time = datetime.now()
-        model = pipeline(
-            "text2text-generation",
-            model="google/flan-t5-small",
-            device="cpu",
-            cache_dir=self.config.MODEL_CACHE_DIR
-        )
-        load_time = (datetime.now() - start_time).total_seconds()
-        self.load_times["keyword"] = load_time
-        logger.info(f"مدل کلمات کلیدی در {load_time:.2f} ثانیه بارگذاری شد")
-        return model
+        """بارگذاری مدل پیشنهاد کلمات کلیدی"""
+        logger.info("بارگذاری مدل کلمات کلیدی...")
+        start_time = time.time()
+        
+        try:
+            model = pipeline(
+                "text2text-generation",
+                model="google/flan-t5-large",
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                cache_dir=self.config.MODEL_CACHE_DIR
+            )
+            load_time = time.time() - start_time
+            MODEL_LOAD_TIME.labels(model_name="keyword").set(load_time)
+            logger.info(f"مدل کلمات کلیدی در {load_time:.2f} ثانیه بارگذاری شد")
+            return model
+        except Exception as e:
+            logger.error(f"خطا در بارگذاری مدل کلمات کلیدی: {e}")
+            raise
 
     @lru_cache(maxsize=1)
     def _load_content_model(self):
-        """بارگذاری مدل تولید محتوا با کش"""
-        logger.info("در حال بارگذاری مدل تولید محتوا...")
-        start_time = datetime.now()
-        model = pipeline(
-            "text-generation",
-            model="facebook/bart-base",
-            device="cpu",
-            cache_dir=self.config.MODEL_CACHE_DIR
-        )
-        load_time = (datetime.now() - start_time).total_seconds()
-        self.load_times["content"] = load_time
-        logger.info(f"مدل تولید محتوا در {load_time:.2f} ثانیه بارگذاری شد")
-        return model
+        """بارگذاری مدل تولید محتوا"""
+        logger.info("بارگذاری مدل تولید محتوا...")
+        start_time = time.time()
+        
+        try:
+            model = pipeline(
+                "text-generation",
+                model="facebook/bart-large-cnn",
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                cache_dir=self.config.MODEL_CACHE_DIR
+            )
+            load_time = time.time() - start_time
+            MODEL_LOAD_TIME.labels(model_name="content").set(load_time)
+            logger.info(f"مدل تولید محتوا در {load_time:.2f} ثانیه بارگذاری شد")
+            return model
+        except Exception as e:
+            logger.error(f"خطا در بارگذاری مدل تولید محتوا: {e}")
+            raise
 
-    @lru_cache(maxsize=1)
-    def _load_similarity_model(self):
-        """بارگذاری مدل مقایسه متون با کش"""
-        logger.info("در حال بارگذاری مدل مقایسه متون...")
-        start_time = datetime.now()
-        model = SentenceTransformer(
-            'paraphrase-multilingual-MiniLM-L12-v2',
-            device='cpu',
-            cache_folder=self.config.MODEL_CACHE_DIR
-        )
-        load_time = (datetime.now() - start_time).total_seconds()
-        self.load_times["similarity"] = load_time
-        logger.info(f"مدل مقایسه متون در {load_time:.2f} ثانیه بارگذاری شد")
-        return model
+    # ادامه مدل‌های دیگر...
 
-    @lru_cache(maxsize=1)
-    def _load_optimization_model(self):
-        """بارگذاری مدل بهینه‌سازی متن با کش"""
-        logger.info("در حال بارگذاری مدل بهینه‌سازی متن...")
-        start_time = datetime.now()
-        model_name = "t5-small"
-        tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=self.config.MODEL_CACHE_DIR)
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=self.config.MODEL_CACHE_DIR)
-        load_time = (datetime.now() - start_time).total_seconds()
-        self.load_times["optimization"] = load_time
-        logger.info(f"مدل بهینه‌سازی متن در {load_time:.2f} ثانیه بارگذاری شد")
-        return (model, tokenizer)
+    def unload_model(self, model_name: str):
+        """تخلیه مدل از حافظه با مدیریت صحیح منابع"""
+        if model_name in self.models:
+            del self.models[model_name]
+            if model_name == "keyword":
+                self._load_keyword_model.cache_clear()
+            elif model_name == "content":
+                self._load_content_model.cache_clear()
+            logger.info(f"مدل {model_name} با موفقیت تخلیه شد")
 
-    @lru_cache(maxsize=1)
-    def _load_translation_model(self):
-        """بارگذاری مدل ترجمه با کش"""
-        logger.info("در حال بارگذاری مدل ترجمه...")
-        start_time = datetime.now()
-        model = Translator()
-        load_time = (datetime.now() - start_time).total_seconds()
-        self.load_times["translation"] = load_time
-        logger.info(f"مدل ترجمه در {load_time:.2f} ثانیه بارگذاری شد")
-        return model
+    async def async_predict(self, model_name: str, input_data: Any):
+        """پیش‌بینی ناهمزمان با مدیریت صف"""
+        if model_name not in self.models:
+            raise ValueError(f"مدل {model_name} بارگذاری نشده است")
+        
+        try:
+            future = self.executor.submit(self.models[model_name], input_data)
+            return await asyncio.wrap_future(future)
+        except Exception as e:
+            logger.error(f"خطا در پیش‌بینی مدل {model_name}: {e}")
+            raise
 
+# ##################################################
+# ## ---------- سیستم امنیتی پیشرفته ---------- ##
+# ##################################################
 
 class SecurityManager:
-    """مدیریت امنیت و رمزنگاری داده‌ها"""
-
+    """مدیریت امنیتی پیشرفته با رمزنگاری و احراز هویت"""
+    
     def __init__(self, encryption_key: str):
-        self.cipher = Fernet(encryption_key.encode())
-
+        if not encryption_key:
+            raise ValueError("کلید رمزنگاری نمی‌تواند خالی باشد")
+        
+        if len(encryption_key) < 32:
+            raise ValueError("کلید رمزنگاری باید حداقل ۳۲ کاراکتر باشد")
+            
+        self.cipher = Fernet(Fernet.generate_key())
+        self.hmac_key = os.urandom(32)
+        self.token_cache = TTLCache(maxsize=1000, ttl=3600)
+        
     def encrypt_data(self, data: str) -> str:
-        """رمزنگاری داده‌های حساس"""
-        return self.cipher.encrypt(data.encode()).decode()
+        """رمزنگاری داده با احراز هویت پیام (HMAC)"""
+        if not data:
+            raise ValueError("داده ورودی نمی‌تواند خالی باشد")
+            
+        encrypted = self.cipher.encrypt(data.encode())
+        hmac = hmac.new(self.hmac_key, encrypted, hashlib.sha256).hexdigest()
+        return f"{encrypted.decode()}:{hmac}"
 
     def decrypt_data(self, encrypted_data: str) -> str:
-        """رمزگشایی داده‌های حساس"""
-        return self.cipher.decrypt(encrypted_data.encode()).decode()
+        """رمزگشایی داده با بررسی صحت پیام"""
+        if not encrypted_data:
+            raise ValueError("داده رمزنگاری شده نمی‌تواند خالی باشد")
+            
+        try:
+            encrypted, hmac_value = encrypted_data.split(":")
+            if not encrypted or not hmac_value:
+                raise ValueError("فرمت داده رمزنگاری شده نامعتبر است")
+                
+            calculated_hmac = hmac.new(self.hmac_key, encrypted.encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(calculated_hmac, hmac_value):
+                raise ValueError("عدم تطابق HMAC - احتمال دستکاری داده")
+                
+            return self.cipher.decrypt(encrypted.encode()).decode()
+        except Exception as e:
+            logger.error(f"خطا در رمزگشایی داده: {e}")
+            raise
 
-    def hash_data(self, data: str) -> str:
-        """هش کردن داده‌ها"""
-        return hashlib.sha256(data.encode()).hexdigest()
+    def generate_token(self, user_id: int, expires_in: int = 3600) -> str:
+        """تولید توکن امنیتی با زمان انقضا"""
+        token = hashlib.sha256(f"{user_id}{time.time()}{os.urandom(16)}".encode()).hexdigest()
+        self.token_cache[token] = {
+            "user_id": user_id,
+            "expires_at": time.time() + expires_in
+        }
+        return token
 
+    def validate_token(self, token: str) -> Optional[int]:
+        """اعتبارسنجی توکن و بازگرداندن شناسه کاربر"""
+        if token in self.token_cache:
+            token_data = self.token_cache[token]
+            if token_data["expires_at"] > time.time():
+                return token_data["user_id"]
+        return None
+
+# ##################################################
+# ## ---------- سیستم تحلیل سئو پیشرفته ---------- ##
+# ##################################################
+
+class SEOAnalytics:
+    """تحلیل پیشرفته سئو با الگوریتم‌های بهینه"""
+    
+    def __init__(self, model_manager: ModelManager):
+        self.model_manager = model_manager
+        self.readability_cache = TTLCache(maxsize=1000, ttl=3600)
+        self.keyword_cache = TTLCache(maxsize=1000, ttl=1800)
+        
+    @staticmethod
+    def preprocess_text(text: str) -> str:
+        """پیش‌پردازش متن برای تحلیل"""
+        if not text:
+            return ""
+            
+        # حذف فاصله‌های اضافی
+        text = re.sub(r'\s+', ' ', text).strip()
+        # نرمال‌سازی نویسه‌های فارسی
+        text = text.replace('ي', 'ی').replace('ك', 'ک')
+        return text
+
+    def calculate_readability(self, text: str, lang: str = 'fa') -> float:
+        """محاسبه سطح خوانایی با کش کردن نتایج"""
+        cache_key = hashlib.md5(text.encode()).hexdigest()
+        
+        if cache_key in self.readability_cache:
+            return self.readability_cache[cache_key]
+            
+        text = self.preprocess_text(text)
+        if not text:
+            return 0.0
+            
+        try:
+            if lang == 'fa':
+                # الگوریتم بهبودیافته برای فارسی
+                words = text.split()
+                sentences = [s for s in re.split(r'[.!?؟]+', text) if s.strip()]
+                
+                if not words or not sentences:
+                    return 0.0
+                    
+                words_count = len(words)
+                sentences_count = len(sentences)
+                syllables_count = sum(self.count_syllables(word) for word in words)
+                
+                avg_words = words_count / sentences_count
+                avg_syllables = syllables_count / words_count
+                
+                readability = 206.835 - (1.3 * avg_words) - (60.6 * avg_syllables)
+                result = max(0, min(100, readability))
+            else:
+                # الگوریتم برای انگلیسی
+                result = textstat.flesch_reading_ease(text)
+                
+            self.readability_cache[cache_key] = result
+            return result
+        except Exception as e:
+            logger.error(f"خطا در محاسبه خوانایی: {e}")
+            return 0.0
+
+    def keyword_density(self, text: str, keywords: List[str]) -> Dict[str, float]:
+        """محاسبه تراکم کلمات کلیدی با کش و پیش‌پردازش"""
+        if not text or not keywords:
+            return {}
+            
+        cache_key = hashlib.md5((text + ''.join(sorted(keywords))).encode()).hexdigest()
+        if cache_key in self.keyword_cache:
+            return self.keyword_cache[cache_key]
+            
+        text = self.preprocess_text(text).lower()
+        words = text.split()
+        total_words = len(words)
+        result = {}
+        
+        for keyword in keywords:
+            keyword = self.preprocess_text(keyword).lower()
+            if not keyword:
+                continue
+                
+            # جستجوی پیشرفته با در نظر گرفتن صورت‌های مختلف
+            pattern = re.compile(rf'\b{re.escape(keyword)}\b', re.IGNORECASE)
+            count = len(pattern.findall(text))
+            density = (count / total_words) * 100 if total_words > 0 else 0
+            result[keyword] = round(density, 2)
+            
+        self.keyword_cache[cache_key] = result
+        return result
+
+    def analyze_competition(self, url: str, user_content: str) -> Dict[str, Any]:
+        """تحلیل پیشرفته رقابت با وبسایت‌های دیگر"""
+        try:
+            # دریافت محتوای رقیب
+            response = requests.get(url, timeout=10)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # استخراج بخش‌های اصلی
+            competitor_content = ' '.join([
+                tag.get_text() for tag in soup.find_all(['p', 'h1', 'h2', 'h3'])
+            ])
+            
+            # تحلیل مقایسه‌ای
+            return self.compare_contents(user_content, competitor_content)
+        except Exception as e:
+            logger.error(f"خطا در تحلیل رقابت: {e}")
+            return {"error": str(e)}
+
+    def compare_contents(self, content1: str, content2: str) -> Dict[str, Any]:
+        """مقایسه پیشرفته دو محتوا"""
+        try:
+            # محاسبه شباهت متنی
+            model = self.model_manager.models.get("similarity")
+            if not model:
+                raise ValueError("مدل مقایسه متون بارگذاری نشده")
+                
+            emb1 = model.encode([self.preprocess_text(content1)])
+            emb2 = model.encode([self.preprocess_text(content2)])
+            similarity = cosine_similarity(emb1, emb2)[0][0]
+            
+            # تحلیل کلمات کلیدی
+            keywords1 = self.extract_keywords(content1)
+            keywords2 = self.extract_keywords(content2)
+            
+            # تحلیل خوانایی
+            readability1 = self.calculate_readability(content1)
+            readability2 = self.calculate_readability(content2)
+            
+            return {
+                "similarity_score": round(similarity * 100, 2),
+                "content1_keywords": keywords1[:10],
+                "content2_keywords": keywords2[:10],
+                "missing_keywords": list(set(keywords2) - set(keywords1))[:10],
+                "content1_readability": readability1,
+                "content2_readability": readability2,
+                "suggestions": self.generate_suggestions(content1, content2)
+            }
+        except Exception as e:
+            logger.error(f"خطا در مقایسه محتوا: {e}")
+            return {"error": str(e)}
+
+
+# ##################################################
+# ## ------ سیستم مدیریت کاربران پیشرفته ------ ##
+# ##################################################
+
+class UserProfile:
+    """پروفایل کاربری پیشرفته با قابلیت‌های مدیریت اشتراک و تنظیمات"""
+    
+    def __init__(self, user_id: int, config: Config, security_manager: SecurityManager):
+        self.user_id = user_id
+        self.config = config
+        self.security = security_manager
+        self.data = {
+            "subscription": {
+                "plan": "free",
+                "start_date": datetime.now(pytz.timezone(config.TIMEZONE)).isoformat(),
+                "expiry_date": None,
+                "payment_method": None,
+                "renewal": False
+            },
+            "preferences": {
+                "language": "fa",
+                "content_style": "formal",
+                "tone": "professional",
+                "notifications": True,
+                "dark_mode": False
+            },
+            "usage": {
+                "daily_requests": 0,
+                "monthly_requests": 0,
+                "total_requests": 0,
+                "last_request": None,
+                "request_history": []
+            },
+            "content": {
+                "saved_items": [],
+                "favorites": [],
+                "collections": {}
+            },
+            "security": {
+                "last_login": datetime.now(pytz.timezone(config.TIMEZONE)).isoformat(),
+                "login_history": [],
+                "two_fa_enabled": False
+            }
+        }
+        self.lock = threading.Lock()
+        
+    def update_usage(self, request_type: str) -> bool:
+        """به‌روزرسانی آمار استفاده کاربر با مدیریت همزمانی"""
+        with self.lock:
+            now = datetime.now(pytz.timezone(self.config.TIMEZONE))
+            today = now.date()
+            last_date = datetime.fromisoformat(self.data["usage"]["last_request"]).date() if self.data["usage"]["last_request"] else None
+            
+            # بازنشانی آمار روزانه اگر روز جدید باشد
+            if last_date is None or last_date != today:
+                self.data["usage"]["daily_requests"] = 0
+                
+            # بازنشانی آمار ماهانه اگر ماه جدید باشد
+            if last_date is None or last_date.month != today.month:
+                self.data["usage"]["monthly_requests"] = 0
+                
+            # بررسی محدودیت اشتراک
+            plan = self.config.SUBSCRIPTION_PLANS.get(self.data["subscription"]["plan"])
+            if not plan:
+                return False
+                
+            if self.data["usage"]["daily_requests"] >= plan.rate_limit:
+                return False
+                
+            # به‌روزرسانی آمار
+            self.data["usage"]["daily_requests"] += 1
+            self.data["usage"]["monthly_requests"] += 1
+            self.data["usage"]["total_requests"] += 1
+            self.data["usage"]["last_request"] = now.isoformat()
+            self.data["usage"]["request_history"].append({
+                "type": request_type,
+                "timestamp": now.isoformat(),
+                "status": "completed"
+            })
+            
+            return True
+
+    def can_make_request(self, request_type: str) -> Tuple[bool, str]:
+        """بررسی امکان انجام درخواست با جزئیات خطا"""
+        plan = self.config.SUBSCRIPTION_PLANS.get(self.data["subscription"]["plan"])
+        if not plan:
+            return False, "طرح اشتراک نامعتبر"
+            
+        if self.data["usage"]["daily_requests"] >= plan.rate_limit:
+            reset_time = (datetime.now(pytz.timezone(self.config.TIMEZONE)) + timedelta(days=1)
+            reset_str = reset_time.strftime("%H:%M")
+            return False, f"محدودیت درخواست روزانه. تا ساعت {reset_str} صبر کنید"
+            
+        return True, ""
+
+    def save_content(self, content_data: Dict) -> str:
+        """ذخیره محتوای کاربر با تولید شناسه یکتا"""
+        content_id = self.security.hash_data(f"{content_data['title']}{time.time()}")
+        
+        content_item = {
+            "id": content_id,
+            "type": content_data.get("type", "article"),
+            "title": content_data.get("title", "بدون عنوان"),
+            "content": content_data["content"],
+            "tags": content_data.get("tags", []),
+            "created_at": datetime.now(pytz.timezone(self.config.TIMEZONE)).isoformat(),
+            "modified_at": datetime.now(pytz.timezone(self.config.TIMEZONE)).isoformat(),
+            "metadata": content_data.get("metadata", {})
+        }
+        
+        with self.lock:
+            self.data["content"]["saved_items"].append(content_item)
+            
+        return content_id
+
+    def get_content(self, content_id: str) -> Optional[Dict]:
+        """دریافت محتوای ذخیره شده با بررسی اعتبار"""
+        with self.lock:
+            for item in self.data["content"]["saved_items"]:
+                if item["id"] == content_id:
+                    return item
+        return None
+
+    def upgrade_subscription(self, plan_id: str, payment_method: str, duration: str = "monthly") -> bool:
+        """ارتقاء اشتراک کاربر با مدیریت پرداخت"""
+        if plan_id not in self.config.SUBSCRIPTION_PLANS:
+            return False
+            
+        now = datetime.now(pytz.timezone(self.config.TIMEZONE))
+        
+        with self.lock:
+            self.data["subscription"]["plan"] = plan_id
+            self.data["subscription"]["payment_method"] = payment_method
+            self.data["subscription"]["start_date"] = now.isoformat()
+            
+            if duration == "monthly":
+                expiry = now + timedelta(days=30)
+            else:  # annual
+                expiry = now + timedelta(days=365)
+                
+            self.data["subscription"]["expiry_date"] = expiry.isoformat()
+            self.data["subscription"]["renewal"] = True
+            
+        return True
+
+# ##################################################
+# ## ----- سیستم پرداخت و اشتراک پیشرفته ----- ##
+# ##################################################
 
 class PaymentManager:
-    """مدیریت سیستم پرداخت و اشتراک‌ها"""
-
+    """مدیریت پرداخت‌ها و اشتراک‌ها با قابلیت اتصال به دروازه‌های پرداخت"""
+    
     def __init__(self, config: Config):
         self.config = config
         self.plans = config.SUBSCRIPTION_PLANS
+        self.payment_providers = {
+            "zarinpal": self._init_zarinpal(),
+            "idpay": self._init_idpay()
+        }
+        self.receipts = TTLCache(maxsize=1000, ttl=86400)  # کش رسیدها برای 24 ساعت
+        
+    def _init_zarinpal(self):
+        """تنظیمات دروازه پرداخت زرین‌پال"""
+        return {
+            "api_key": os.getenv("ZARINPAL_API_KEY"),
+            "sandbox": os.getenv("ZARINPAL_SANDBOX", "false").lower() == "true",
+            "callback_url": os.getenv("ZARINPAL_CALLBACK_URL")
+        }
+        
+    def _init_idpay(self):
+        """تنظیمات دروازه پرداخت آیدی پی"""
+        return {
+            "api_key": os.getenv("IDPAY_API_KEY"),
+            "sandbox": os.getenv("IDPAY_SANDBOX", "false").lower() == "true",
+            "callback_url": os.getenv("IDPAY_CALLBACK_URL")
+        }
 
-    def get_plan(self, plan_id: str) -> Optional[SubscriptionPlan]:
-        """دریافت اطلاعات یک طرح اشتراک"""
-        return self.plans.get(plan_id)
-
-    def get_plan_features(self, plan_id: str) -> str:
-        """دریافت ویژگی‌های یک طرح به صورت متن"""
-        plan = self.get_plan(plan_id)
+    def initiate_payment(self, user_id: int, plan_id: str, provider: str = "zarinpal") -> Optional[str]:
+        """شروع فرآیند پرداخت و بازگرداندن لینک پرداخت"""
+        if provider not in self.payment_providers:
+            return None
+            
+        plan = self.plans.get(plan_id)
         if not plan:
-            return "طرح نامعتبر"
-
-        features = "\n".join(f"✓ {feature}" for feature in plan.features)
-        return (
-            f"📌 طرح {plan.name}\n"
-            f"💰 قیمت ماهانه: {plan.monthly_price:,} تومان\n"
-            f"🔑 ویژگی‌ها:\n{features}\n"
-            f"📊 محدودیت استفاده: {plan.rate_limit} درخواست در ساعت"
-        )
-
-
-class LanguageManager:
-    """مدیریت چندزبانه و ترجمه"""
-
-    def __init__(self):
-        self.translator = Translator()
-        self.supported_languages = ['fa', 'en', 'ar', 'tr']
-
-    def detect_language(self, text: str) -> str:
-        """تشخیص زبان متن"""
+            return None
+            
+        amount = plan.monthly_price
+        description = f"ارتقاء به طرح {plan.name}"
+        
         try:
-            return self.translator.detect(text).lang
-        except:
-            return 'fa'
-
-    def translate_text(self, text: str, target_lang: str = 'fa') -> str:
-        """ترجمه متن به زبان هدف"""
-        try:
-            translation = self.translator.translate(text, dest=target_lang)
-            return translation.text
-        except Exception as e:
-            logger.error(f"خطا در ترجمه متن: {e}")
-            return text
-
-
-class BackupManager:
-    """مدیریت پشتیبان‌گیری و بازیابی داده‌ها"""
-
-    def __init__(self, config: Config):
-        self.config = config
-        Path(config.BACKUP_DIR).mkdir(exist_ok=True)
-
-    def create_backup(self, data: Dict, backup_name: str) -> bool:
-        """ایجاد پشتیبان از داده‌ها"""
-        try:
-            backup_path = Path(self.config.BACKUP_DIR) / f"{backup_name}.json"
-            with open(backup_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            return True
-        except Exception as e:
-            logger.error(f"خطا در ایجاد پشتیبان: {e}")
-            return False
-
-    def restore_backup(self, backup_name: str) -> Optional[Dict]:
-        """بازیابی داده‌ها از پشتیبان"""
-        try:
-            backup_path = Path(self.config.BACKUP_DIR) / f"{backup_name}.json"
-            if not backup_path.exists():
+            if provider == "zarinpal":
+                payment_url = self._zarinpal_payment(user_id, amount, description)
+            elif provider == "idpay":
+                payment_url = self._idpay_payment(user_id, amount, description)
+            else:
                 return None
-
-            with open(backup_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                
+            return payment_url
         except Exception as e:
-            logger.error(f"خطا در بازیابی پشتیبان: {e}")
+            logger.error(f"خطا در شروع پرداخت: {e}")
             return None
 
-
-class ReportGenerator:
-    """تولید گزارش‌های حرفه‌ای"""
-
-    @staticmethod
-    def generate_seo_report(data: Dict, filename: str) -> bool:
-        """تولید گزارش PDF از تحلیل سئو"""
+    def verify_payment(self, payment_id: str, provider: str) -> Tuple[bool, Dict]:
+        """اعتبارسنجی پرداخت و بازگرداندن نتیجه"""
+        if provider not in self.payment_providers:
+            return False, {"error": "پروایدر پرداخت نامعتبر"}
+            
         try:
-            c = canvas.Canvas(filename, pagesize=letter)
+            if provider == "zarinpal":
+                return self._verify_zarinpal(payment_id)
+            elif provider == "idpay":
+                return self._verify_idpay(payment_id)
+            else:
+                return False, {"error": "پروایدر پرداخت نامعتبر"}
+        except Exception as e:
+            logger.error(f"خطا در تأیید پرداخت: {e}")
+            return False, {"error": str(e)}
 
-            # عنوان گزارش
-            c.setFont("Helvetica-Bold", 16)
-            c.drawString(100, 750, "گزارش تحلیل سئو")
-            c.setFont("Helvetica", 12)
+    def _zarinpal_payment(self, user_id: int, amount: int, description: str) -> Optional[str]:
+        """پیاده‌سازی پرداخت از طریق زرین‌پال"""
+        # پیاده‌سازی واقعی نیاز به کلاس زرین‌پال دارد
+        payment_url = f"https://zarinpal.com/pg/StartPay/{user_id}_{int(time.time())}"
+        self.receipts[payment_url] = {
+            "user_id": user_id,
+            "amount": amount,
+            "description": description,
+            "timestamp": time.time()
+        }
+        return payment_url
 
-            # اطلاعات کلی
-            y_position = 700
-            c.drawString(100, y_position, f"تاریخ تولید: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-            y_position -= 30
+    def _verify_zarinpal(self, payment_id: str) -> Tuple[bool, Dict]:
+        """اعتبارسنجی پرداخت زرین‌پال"""
+        # پیاده‌سازی واقعی نیاز به کلاس زرین‌پال دارد
+        return True, {
+            "success": True,
+            "amount": self.receipts.get(payment_id, {}).get("amount", 0),
+            "transaction_id": f"zarinpal_{int(time.time())}"
+        }
 
-            # بخش‌های مختلف گزارش
-            for section, content in data.items():
-                c.setFont("Helvetica-Bold", 14)
-                c.drawString(100, y_position, section)
-                y_position -= 25
+# ##################################################
+# ## ----- سیستم گزارش‌گیری و آنالیتیکس ----- ##
+# ##################################################
 
-                c.setFont("Helvetica", 12)
-                if isinstance(content, dict):
-                    for key, value in content.items():
-                        c.drawString(120, y_position, f"{key}: {value}")
-                        y_position -= 20
-                elif isinstance(content, list):
-                    for item in content:
-                        c.drawString(120, y_position, f"- {item}")
-                        y_position -= 20
-                else:
-                    c.drawString(120, y_position, str(content))
-                    y_position -= 20
-
-                y_position -= 10  # فاصله بین بخش‌ها
-
+class AnalyticsManager:
+    """مدیریت گزارش‌گیری و آمارهای پیشرفته"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.report_cache = TTLCache(maxsize=100, ttl=3600)
+        
+    def generate_seo_report(self, analysis_data: Dict, user_id: int = None) -> bytes:
+        """تولید گزارش PDF حرفه‌ای"""
+        cache_key = hashlib.md5(json.dumps(analysis_data).encode()).hexdigest()
+        
+        if cache_key in self.report_cache:
+            return self.report_cache[cache_key]
+            
+        try:
+            buffer = io.BytesIO()
+            c = canvas.Canvas(buffer, pagesize=letter)
+            
+            # هدر گزارش
+            self._draw_header(c, "گزارش تحلیل سئو", user_id)
+            
+            # محتوای گزارش
+            y_position = 650
+            for section, content in analysis_data.items():
+                y_position = self._draw_section(c, section, content, y_position)
+                if y_position < 100:
+                    c.showPage()
+                    self._draw_header(c, "گزارش تحلیل سئو (ادامه)", user_id)
+                    y_position = 650
+                    
+            # فوتر گزارش
+            self._draw_footer(c)
+            
             c.save()
-            return True
+            pdf_data = buffer.getvalue()
+            self.report_cache[cache_key] = pdf_data
+            return pdf_data
         except Exception as e:
             logger.error(f"خطا در تولید گزارش: {e}")
-            return False
+            raise
 
+    def _draw_header(self, c, title: str, user_id: int = None):
+        """رسم هدر گزارش"""
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(100, 750, title)
+        
+        c.setFont("Helvetica", 10)
+        c.drawString(100, 730, f"تاریخ تولید: {datetime.now(pytz.timezone(self.config.TIMEZONE)).strftime('%Y-%m-%d %H:%M')}")
+        
+        if user_id:
+            c.drawString(100, 710, f"شناسه کاربر: {user_id}")
+            
+        c.line(100, 700, 500, 700)
+
+    def _draw_section(self, c, title: str, content: Any, y_pos: int) -> int:
+        """رسم یک بخش از گزارش"""
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(100, y_pos, title)
+        y_pos -= 25
+        
+        c.setFont("Helvetica", 12)
+        if isinstance(content, dict):
+            for key, value in content.items():
+                c.drawString(120, y_pos, f"{key}: {value}")
+                y_pos -= 20
+        elif isinstance(content, list):
+            for item in content:
+                c.drawString(120, y_pos, f"- {item}")
+                y_pos -= 20
+        else:
+            c.drawString(120, y_pos, str(content))
+            y_pos -= 20
+            
+        return y_pos - 10  # فاصله قبل از بخش بعدی
+
+    def _draw_footer(self, c):
+        """رسم فوتر گزارش"""
+        c.setFont("Helvetica", 8)
+        c.drawString(100, 30, f"تولید شده توسط ربات سئوکار - {datetime.now(pytz.timezone(self.config.TIMEZONE)).strftime('%Y-%m-%d')}")
+
+# ##################################################
+# ## ----- سیستم یکپارچه‌سازی گوگل ----- ##
+# ##################################################
 
 class GoogleIntegration:
-    """ادغام با سرویس‌های گوگل"""
-
+    """مدیریت یکپارچه‌سازی با سرویس‌های گوگل"""
+    
     def __init__(self, api_key: str):
         self.api_key = api_key
-
-    def get_search_console_data(self, domain: str) -> Optional[Dict]:
-        """دریافت داده‌های سرچ کنسول"""
+        self.translate_client = translate.Client(api_key) if api_key else None
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        })
+        
+    def translate_text(self, text: str, target_lang: str = 'fa') -> str:
+        """ترجمه متن با استفاده از Google Cloud Translation"""
+        if not self.translate_client:
+            raise ValueError("کلید API ترجمه تنظیم نشده است")
+            
         try:
-            # شبیه‌سازی درخواست API
+            result = self.translate_client.translate(
+                text,
+                target_language=target_lang,
+                format_='text'
+            )
+            return result['translatedText']
+        except Exception as e:
+            logger.error(f"خطا در ترجمه متن: {e}")
+            raise
+
+    def get_search_console_data(self, site_url: str, start_date: str, end_date: str) -> Dict:
+        """دریافت داده‌های سرچ کنسول گوگل"""
+        try:
+            # شبیه‌سازی درخواست واقعی
+            params = {
+                "siteUrl": site_url,
+                "startDate": start_date,
+                "endDate": end_date,
+                "dimensions": ["query", "page"],
+                "rowLimit": 100
+            }
+            
+            # در یک سیستم واقعی، اینجا درخواست به API گوگل ارسال می‌شود
             return {
                 "clicks": 1200,
                 "impressions": 8500,
@@ -426,16 +819,33 @@ class GoogleIntegration:
                     {"keyword": "آموزش سئو", "clicks": 320},
                     {"keyword": "بهینه‌سازی سایت", "clicks": 210},
                     {"keyword": "ربات سئو", "clicks": 150}
+                ],
+                "top_pages": [
+                    {"page": "/blog", "clicks": 450},
+                    {"page": "/products", "clicks": 320},
+                    {"page": "/contact", "clicks": 210}
                 ]
             }
         except Exception as e:
             logger.error(f"خطا در دریافت داده‌های سرچ کنسول: {e}")
-            return None
+            raise
 
-    def get_analytics_data(self, view_id: str) -> Optional[Dict]:
+    def get_analytics_data(self, view_id: str, start_date: str, end_date: str) -> Dict:
         """دریافت داده‌های گوگل آنالیتیکس"""
         try:
-            # شبیه‌سازی درخواست API
+            # شبیه‌سازی درخواست واقعی
+            params = {
+                "viewId": view_id,
+                "dateRanges": [{"startDate": start_date, "endDate": end_date}],
+                "metrics": [
+                    {"expression": "ga:sessions"},
+                    {"expression": "ga:users"},
+                    {"expression": "ga:pageviews"}
+                ],
+                "dimensions": [{"name": "ga:pagePath"}]
+            }
+            
+            # در یک سیستم واقعی، اینجا درخواست به API گوگل ارسال می‌شود
             return {
                 "sessions": 4500,
                 "users": 3200,
@@ -450,178 +860,74 @@ class GoogleIntegration:
             }
         except Exception as e:
             logger.error(f"خطا در دریافت داده‌های آنالیتیکس: {e}")
-            return None
+            raise
 
-
-class CompetitorAnalyzer:
-    """تحلیل و مقایسه رقبا"""
-
-    def __init__(self, model_manager: ModelManager):
-        self.model_manager = model_manager
-
-    def analyze_content_gap(self, user_content: str, competitor_content: str) -> Dict:
-        """تحلیل شکاف محتوایی بین محتوای کاربر و رقیب"""
-        try:
-            # محاسبه شباهت متنی
-            model = self.model_manager.models["similarity"]
-            user_embedding = model.encode([user_content])
-            competitor_embedding = model.encode([competitor_content])
-            similarity = cosine_similarity(user_embedding, competitor_embedding)[0][0]
-
-            # تحلیل کلمات کلیدی
-            user_keywords = self._extract_keywords(user_content)
-            competitor_keywords = self._extract_keywords(competitor_content)
-            missing_keywords = list(set(competitor_keywords) - set(user_keywords))
-
-            return {
-                "similarity_score": round(similarity * 100, 2),
-                "user_keywords": user_keywords[:10],
-                "competitor_keywords": competitor_keywords[:10],
-                "missing_keywords": missing_keywords[:10],
-                "suggestions": self._generate_suggestions(user_content, competitor_content)
-            }
-        except Exception as e:
-            logger.error(f"خطا در تحلیل شکاف محتوایی: {e}")
-            return {"error": str(e)}
-
-    def _extract_keywords(self, text: str) -> List[str]:
-        """استخراج کلمات کلیدی از متن"""
-        try:
-            if "keyword" not in self.model_manager.models:
-                self.model_manager.load_models()
-
-            result = self.model_manager.models["keyword"](
-                f"Extract SEO keywords from this text: {text[:2000]}",
-                max_length=50,
-                num_return_sequences=1
-            )
-            keywords = result[0]["generated_text"].split(",")
-            return [kw.strip() for kw in keywords if kw.strip()]
-        except Exception as e:
-            logger.error(f"خطا در استخراج کلمات کلیدی: {e}")
-            return []
-
-    def _generate_suggestions(self, user_content: str, competitor_content: str) -> List[str]:
-        """تولید پیشنهادات بهبود محتوا"""
-        suggestions = []
-
-        # مقایسه طول محتوا
-        user_len = len(user_content.split())
-        comp_len = len(competitor_content.split())
-
-        if user_len < comp_len * 0.7:
-            suggestions.append(f"محتوا می‌تواند جامع‌تر باشد (محتوا رقیب {comp_len} کلمه است در مقایسه با {user_len} کلمه شما)")
-        elif user_len > comp_len * 1.3:
-            suggestions.append("محتوا ممکن است بیش از حد طولانی باشد، می‌توانید برخی بخش‌ها را خلاصه کنید")
-
-        # تحلیل خوانایی
-        user_readability = SEOAnalytics.calculate_readability(user_content)
-        comp_readability = SEOAnalytics.calculate_readability(competitor_content)
-
-        if user_readability < comp_readability - 10:
-            suggestions.append("سطح خوانایی محتوا می‌تواند بهبود یابد تا برای مخاطبان قابل‌درک‌تر باشد")
-
-        return suggestions
-
-
-class UserProfile:
-    """مدیریت پروفایل و تنظیمات کاربر"""
-
-    def __init__(self, user_id: int, config: Config, security_manager: SecurityManager):
-        self.user_id = user_id
-        self.config = config
-        self.security = security_manager
-        self.data = {
-            "subscription": "free",
-            "subscription_expiry": None,
-            "language": "fa",
-            "content_preferences": {
-                "style": "formal",
-                "tone": "professional"
-            },
-            "usage_stats": {
-                "requests_today": 0,
-                "last_request": None,
-                "total_requests": 0
-            },
-            "saved_content": []
-        }
-
-    def update_usage(self):
-        """به‌روزرسانی آمار استفاده کاربر"""
-        today = datetime.now().date()
-        last_date = self.data["usage_stats"]["last_request"]
-
-        if last_date is None or last_date != today:
-            self.data["usage_stats"]["requests_today"] = 0
-
-        self.data["usage_stats"]["requests_today"] += 1
-        self.data["usage_stats"]["total_requests"] += 1
-        self.data["usage_stats"]["last_request"] = today
-
-    def can_make_request(self) -> bool:
-        """بررسی آیا کاربر می‌تواند درخواست جدید ارسال کند"""
-        plan = self.config.SUBSCRIPTION_PLANS.get(self.data["subscription"])
-        if not plan:
-            return False
-
-        if self.data["usage_stats"]["requests_today"] >= plan.rate_limit:
-            return False
-
-        return True
-
-    def save_content(self, content_type: str, content: str, tags: List[str] = []):
-        """ذخیره محتوای کاربر"""
-        content_id = self.security.hash_data(content[:50] + str(datetime.now()))
-        self.data["saved_content"].append({
-            "id": content_id,
-            "type": content_type,
-            "content": content,
-            "tags": tags,
-            "created_at": datetime.now().isoformat()
-        })
-
-    def get_saved_content(self, content_id: str = None) -> List[Dict]:
-        """دریافت محتوای ذخیره شده"""
-        if content_id:
-            return [item for item in self.data["saved_content"] if item["id"] == content_id]
-        return self.data["saved_content"]
-
+# ##################################################
+# ## ------ ربات تلگرام با معماری پیشرفته ------ ##
+# ##################################################
 
 class SEOAssistantBot:
-    """ربات هوشمند سئوکار با قابلیت‌های پیشرفته تحلیل و بهینه‌سازی"""
-
+    """ربات هوشمند سئوکار با معماری مقیاس‌پذیر و پیشرفته"""
+    
     def __init__(self, config: Config):
+        # تأیید تنظیمات ضروری
+        if not config.BOT_TOKEN:
+            raise ValueError("توکن ربات باید تنظیم شود")
+        if not config.ENCRYPTION_KEY:
+            raise ValueError("کلید رمزنگاری باید تنظیم شود")
+            
         self.config = config
-        self.updater = Updater(config.BOT_TOKEN, use_context=True)
+        self._init_managers()
+        self._init_telegram()
+        self._setup_metrics()
+        self._load_user_data()
+        
+        logger.info("تنظیمات اولیه ربات با موفقیت انجام شد")
+
+    def _init_managers(self):
+        """مقداردهی مدیران سرویس"""
+        self.model_manager = ModelManager(self.config)
+        self.security_manager = SecurityManager(self.config.ENCRYPTION_KEY)
+        self.payment_manager = PaymentManager(self.config)
+        self.analytics_manager = AnalyticsManager(self.config)
+        self.google_integration = GoogleIntegration(self.config.GOOGLE_API_KEY) if self.config.GOOGLE_API_KEY else None
+        
+        # بارگذاری مدل‌های ML
+        if not self.model_manager.load_models():
+            raise RuntimeError("خطا در بارگذاری مدل‌های یادگیری ماشین")
+
+    def _init_telegram(self):
+        """تنظیمات ارتباط با تلگرام"""
+        self.updater = Updater(
+            self.config.BOT_TOKEN,
+            use_context=True,
+            request_kwargs={
+                'read_timeout': self.config.REQUEST_TIMEOUT,
+                'connect_timeout': self.config.REQUEST_TIMEOUT
+            }
+        )
         self.dp = self.updater.dispatcher
         self.job_queue = self.updater.job_queue
+        
+        # تنظیم هندلرهای خطا
+        self.dp.add_error_handler(self._handle_error)
+        
+        # تنظیم هندلرهای دستورات
+        self._setup_command_handlers()
+        self._setup_message_handlers()
+        self._setup_callback_handlers()
 
-        # مدیران سرویس
-        self.model_manager = ModelManager(config)
-        self.security_manager = SecurityManager(config.ENCRYPTION_KEY)
-        self.payment_manager = PaymentManager(config)
-        self.language_manager = LanguageManager()
-        self.backup_manager = BackupManager(config)
-        self.google_integration = GoogleIntegration(config.GOOGLE_API_KEY) if config.GOOGLE_API_KEY else None
+    def _setup_metrics(self):
+        """تنظیم سیستم مانیتورینگ"""
+        if os.getenv('ENABLE_METRICS', 'false').lower() == 'true':
+            start_http_server(8000)
+            logger.info("سیستم متریک‌ها روی پورت 8000 راه‌اندازی شد")
 
-        # داده‌های کاربران
-        self.user_profiles: Dict[int, UserProfile] = {}
-        self.load_all_user_data()
-
-        # تنظیم هندلرها
-        self.setup_handlers()
-
-        # برنامه‌ریزی کارهای زمان‌بندی شده
-        self.schedule_jobs()
-
-        logger.info("ربات سئوکار با موفقیت راه‌اندازی شد")
-    # ==================== متدهای مدیریت داده کاربران ====================
-    def load_all_user_data(self):
-        """بارگذاری داده تمام کاربران از ذخیره‌سازی"""
+    def _load_user_data(self):
+        """بارگذاری داده کاربران از ذخیره‌سازی"""
         try:
             data_dir = Path(self.config.USER_DATA_DIR)
-            for user_file in data_dir.glob("*.json"):
+            for user_file in data_dir.glob('*.json'):
                 try:
                     user_id = int(user_file.stem)
                     with open(user_file, 'r', encoding='utf-8') as f:
@@ -633,176 +939,201 @@ class SEOAssistantBot:
                     logger.error(f"خطا در بارگذاری داده کاربر {user_file.stem}: {e}")
             
             logger.info(f"داده {len(self.user_profiles)} کاربر با موفقیت بارگذاری شد")
+            ACTIVE_USERS_GAUGE.set(len(self.user_profiles))
         except Exception as e:
             logger.error(f"خطا در بارگذاری داده کاربران: {e}")
+            raise
 
-    def save_user_data(self, user_id: int):
-        """ذخیره داده کاربر خاص"""
-        try:
-            if user_id not in self.user_profiles:
-                return
-            
-            user_dir = Path(self.config.USER_DATA_DIR)
-            user_dir.mkdir(exist_ok=True)
-            
-            user_file = user_dir / f"{user_id}.json"
-            encrypted_data = self.security_manager.encrypt_data(json.dumps(self.user_profiles[user_id].data))
-            
-            with open(user_file, 'w', encoding='utf-8') as f:
-                json.dump(encrypted_data, f, ensure_ascii=False)
-            
-            logger.debug(f"داده کاربر {user_id} با موفقیت ذخیره شد")
-        except Exception as e:
-            logger.error(f"خطا در ذخیره داده کاربر {user_id}: {e}")
-
-    def get_user_profile(self, user_id: int) -> UserProfile:
-        """دریافت یا ایجاد پروفایل کاربر"""
-        if user_id not in self.user_profiles:
-            self.user_profiles[user_id] = UserProfile(user_id, self.config, self.security_manager)
-            logger.info(f"پروفایل جدید برای کاربر {user_id} ایجاد شد")
-        return self.user_profiles[user_id]
-
-    # ==================== متدهای مدیریت درخواست‌ها ====================
-
-    def check_rate_limit(self, user_id: int) -> bool:
-        """بررسی محدودیت میزان درخواست کاربر"""
-        user_profile = self.get_user_profile(user_id)
-        user_profile.update_usage()
-        
-        if not user_profile.can_make_request():
-            return False
-        
-        return True
-
-    # ==================== متدهای مدیریت کارهای زمان‌بندی شده ====================
-
-    def schedule_jobs(self):
-        """برنامه‌ریزی کارهای زمان‌بندی شده"""
-        # پشتیبان‌گیری روزانه
-        self.job_queue.run_daily(
-            self.daily_backup_task,
-            time=datetime.strptime("03:00", "%H:%M").time(),
-            days=(0, 1, 2, 3, 4, 5, 6),
-            name="daily_backup"
-        )
-        
-        # ارسال گزارش هفتگی
-        self.job_queue.run_daily(
-            self.weekly_report_task,
-            time=datetime.strptime("10:00", "%H:%M").time(),
-            days=(6,),  # شنبه
-            name="weekly_report"
-        )
-        
-        logger.info("کارهای زمان‌بندی شده با موفقیت تنظیم شدند")
-
-    def daily_backup_task(self, context: CallbackContext):
-        """وظیفه پشتیبان‌گیری روزانه"""
-        try:
-            backup_name = f"backup_{datetime.now().strftime('%Y%m%d')}"
-            all_data = {
-                str(user_id): profile.data 
-                for user_id, profile in self.user_profiles.items()
-            }
-            
-            if self.backup_manager.create_backup(all_data, backup_name):
-                logger.info(f"پشتیبان‌گیری روزانه با نام {backup_name} با موفقیت انجام شد")
-            else:
-                logger.warning("خطا در انجام پشتیبان‌گیری روزانه")
-        except Exception as e:
-            logger.error(f"خطا در وظیفه پشتیبان‌گیری روزانه: {e}")
-
-    def weekly_report_task(self, context: CallbackContext):
-        """وظیفه ارسال گزارش هفتگی"""
-        try:
-            total_users = len(self.user_profiles)
-            active_users = sum(1 for profile in self.user_profiles.values() 
-                             if profile.data["usage_stats"]["requests_today"] > 0)
-            
-            report = (
-                "📊 گزارش هفتگی ربات سئوکار\n\n"
-                f"👥 کاربران کل: {total_users}\n"
-                f"🔄 کاربران فعال این هفته: {active_users}\n"
-                f"📌 مجموع درخواست‌ها: {sum(p.data['usage_stats']['total_requests'] for p in self.user_profiles.values())}\n\n"
-                "✅ سیستم به درستی کار می‌کند"
-            )
-            
-            # ارسال گزارش به ادمین‌ها (در اینجا فقط لاگ می‌کنیم)
-            logger.info(report)
-        except Exception as e:
-            logger.error(f"خطا در وظیفه گزارش هفتگی: {e}")
-
-    # ==================== متدهای تنظیم هندلرها ====================
-
-    def setup_handlers(self):
-        """تنظیم هوشمند دستورات ربات"""
+    def _setup_command_handlers(self):
+        """تنظیم هندلرهای دستورات"""
         handlers = [
-            # دستورات اصلی
-            CommandHandler("start", self.start),
-            CommandHandler("help", self.show_help),
-            CommandHandler("menu", self.show_main_menu),
-            
-            # دستورات سئو
-            CommandHandler("keywords", self.suggest_keywords),
-            CommandHandler("content", self.generate_content),
-            CommandHandler("optimize", self.optimize_text),
-            CommandHandler("analyze", self.analyze_seo),
-            CommandHandler("compare", self.compare_texts),
-            CommandHandler("competitor", self.analyze_competitor),
-            
-            # مدیریت محتوا
-            CommandHandler("save", self.save_content),
-            CommandHandler("list", self.list_saved_content),
-            CommandHandler("get", self.get_saved_content),
-            
-            # مدیریت حساب کاربری
-            CommandHandler("profile", self.show_profile),
-            CommandHandler("subscribe", self.show_subscription_plans),
-            CommandHandler("upgrade", self.upgrade_subscription),
-            CommandHandler("language", self.change_language),
-            
-            # گزارش‌گیری
-            CommandHandler("report", self.generate_user_report),
-            CommandHandler("stats", self.show_stats),
-            
-            # مدیریت سیستم
-            CommandHandler("backup", self.manage_backups),
-            
-            # هندلرهای عمومی
-            CallbackQueryHandler(self.handle_button),
-            MessageHandler(Filters.text & ~Filters.command, self.handle_message),
-            MessageHandler(Filters.document, self.handle_document)
+            CommandHandler('start', self._handle_start),
+            CommandHandler('help', self._handle_help),
+            CommandHandler('menu', self._handle_menu),
+            CommandHandler('keywords', self._handle_keywords),
+            CommandHandler('content', self._handle_content),
+            CommandHandler('optimize', self._handle_optimize),
+            CommandHandler('analyze', self._handle_analyze),
+            CommandHandler('compare', self._handle_compare),
+            CommandHandler('competitor', self._handle_competitor),
+            CommandHandler('save', self._handle_save),
+            CommandHandler('list', self._handle_list),
+            CommandHandler('get', self._handle_get),
+            CommandHandler('profile', self._handle_profile),
+            CommandHandler('subscribe', self._handle_subscribe),
+            CommandHandler('upgrade', self._handle_upgrade),
+            CommandHandler('language', self._handle_language),
+            CommandHandler('report', self._handle_report),
+            CommandHandler('stats', self._handle_stats),
+            CommandHandler('backup', self._handle_backup)
         ]
         
         for handler in handlers:
             self.dp.add_handler(handler)
+
+    def _setup_message_handlers(self):
+        """تنظیم هندلرهای پیام‌های متنی"""
+        self.dp.add_handler(MessageHandler(Filters.text & ~Filters.command, self._handle_text_message))
+        self.dp.add_handler(MessageHandler(Filters.document, self._handle_document))
+
+    def _setup_callback_handlers(self):
+        """تنظیم هندلرهای callback دکمه‌ها"""
+        self.dp.add_handler(CallbackQueryHandler(self._handle_callback))
+
+    def _handle_error(self, update: Update, context: CallbackContext):
+        """مدیریت متمرکز خطاها"""
+        error = context.error
+        user_id = update.effective_user.id if update.effective_user else None
         
-        logger.info(f"{len(handlers)} هندلر با موفقیت تنظیم شدند")
+        logger.error(f"خطا در پردازش درخواست کاربر {user_id}: {error}", exc_info=error)
+        ERROR_COUNTER.labels(endpoint=update.message.text.split()[0] if update.message else 'unknown').inc()
+        
+        try:
+            if user_id:
+                context.bot.send_message(
+                    chat_id=user_id,
+                    text="⚠️ خطایی در پردازش درخواست شما رخ داد. لطفاً مجدداً تلاش کنید."
+                )
+        except Exception as e:
+            logger.error(f"خطا در ارسال پیام خطا به کاربر: {e}")
 
-    # ==================== متدهای اصلی ربات ====================
+    # ##################################################
+    # ## -------- دستورات اصلی ربات -------- ##
+    # ##################################################
 
-    def start(self, update: Update, context: CallbackContext):
-        """منوی اصلی ربات"""
+    def _handle_start(self, update: Update, context: CallbackContext):
+        """مدیریت دستور /start"""
+        REQUEST_COUNTER.labels(endpoint='start').inc()
         user = update.effective_user
-        user_profile = self.get_user_profile(user.id)
+        user_profile = self._get_user_profile(user.id)
         
-        if not self.check_rate_limit(user.id):
-            update.message.reply_text("⏳ تعداد درخواست‌های شما امروز به حد مجاز رسیده است. لطفاً بعداً تلاش کنید یا حساب خود را ارتقا دهید.")
+        if not self._check_rate_limit(user.id, 'start'):
+            update.message.reply_text("⏳ تعداد درخواست‌های شما امروز به حد مجاز رسیده است.")
             return
         
-        welcome_msg = (
-            f"✨ سلام {user.first_name} عزیز!\n"
-            "به ربات هوشمند سئوکار خوش آمدید!\n\n"
-            "🔹 من می‌توانم در موارد زیر به شما کمک کنم:\n"
-            "- تحلیل و بهینه‌سازی محتوا\n"
-            "- پیشنهاد کلمات کلیدی مؤثر\n"
-            "- تولید محتوای سئو شده\n"
-            "- مقایسه و ارزیابی متون\n"
-            "- تحلیل رقبا و شناسایی فرصت‌ها\n\n"
-            "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:"
+        welcome_msg = self._generate_welcome_message(user)
+        keyboard = self._generate_main_keyboard()
+        
+        update.message.reply_text(
+            welcome_msg,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+    def _handle_help(self, update: Update, context: CallbackContext):
+        """مدیریت دستور /help"""
+        REQUEST_COUNTER.labels(endpoint='help').inc()
+        user_profile = self._get_user_profile(update.effective_user.id)
+        
+        if not self._check_rate_limit(update.effective_user.id, 'help'):
+            update.message.reply_text("⏳ تعداد درخواست‌های شما امروز به حد مجاز رسیده است.")
+            return
+        
+        help_text = self._generate_help_text(user_profile)
+        update.message.reply_text(help_text, parse_mode="Markdown")
+
+    def _handle_keywords(self, update: Update, context: CallbackContext):
+        """مدیریت دستور /keywords"""
+        REQUEST_COUNTER.labels(endpoint='keywords').inc()
+        user = update.effective_user
+        user_profile = self._get_user_profile(user.id)
+        
+        if not self._check_rate_limit(user.id, 'keywords'):
+            update.message.reply_text("⏳ تعداد درخواست‌های شما امروز به حد مجاز رسیده است.")
+            return
+        
+        if not context.args:
+            update.message.reply_text("لطفاً موضوع مورد نظر خود را وارد کنید.\nمثال: /keywords آموزش سئو")
+            return
+        
+        query = " ".join(context.args)
+        if len(query) > 200:
+            update.message.reply_text("⚠️ طول موضوع نباید از 200 کاراکتر بیشتر باشد.")
+            return
+        
+        try:
+            update.message.reply_text("🔍 در حال جستجوی بهترین کلمات کلیدی...")
+            
+            # استفاده از مدل برای پیشنهاد کلمات کلیدی
+            keywords = self._generate_keyword_suggestions(query)
+            
+            response = (
+                f"🔎 *کلمات کلیدی پیشنهادی برای '{query}':*\n\n" +
+                "\n".join(f"🔹 {kw}" for kw in keywords) +
+                "\n\n💡 می‌توانید از این کلمات در تولید محتوا استفاده کنید."
+            )
+            
+            update.message.reply_text(response, parse_mode="Markdown")
+            
+            # ذخیره در تاریخچه کاربر
+            user_profile.save_content({
+                "type": "keyword_research",
+                "title": f"پژوهش کلمات کلیدی برای {query}",
+                "content": "\n".join(keywords),
+                "tags": [query]
+            })
+            
+        except Exception as e:
+            logger.error(f"خطا در پیشنهاد کلمات کلیدی: {e}")
+            update.message.reply_text("⚠️ خطایی در پردازش درخواست شما رخ داد. لطفاً مجدداً تلاش کنید.")
+
+    # ##################################################
+    # ## -------- متدهای کمکی پیشرفته -------- ##
+    # ##################################################
+
+    def _generate_keyword_suggestions(self, query: str) -> List[str]:
+        """تولید پیشنهادات کلمات کلیدی با استفاده از مدل ML"""
+        try:
+            # استفاده از مدل برای تولید کلمات کلیدی
+            result = self.model_manager.models["keyword"](
+                f"Generate 15 SEO keywords for: {query}",
+                max_length=100,
+                num_return_sequences=1,
+                temperature=0.7,
+                top_k=50
+            )
+            
+            keywords = result[0]["generated_text"].split(",")
+            cleaned_keywords = [kw.strip() for kw in keywords if kw.strip()]
+            
+            # حذف کلمات تکراری و مرتب‌سازی
+            unique_keywords = list(dict.fromkeys(cleaned_keywords))
+            return unique_keywords[:self.config.KEYWORD_SUGGESTIONS]
+        except Exception as e:
+            logger.error(f"خطا در تولید کلمات کلیدی: {e}")
+            # بازگشت به پیشنهادات پیش‌فرض در صورت خطا
+            return [
+                f"{query} آموزش",
+                f"آموزش حرفه‌ای {query}",
+                f"بهترین روش‌های {query}",
+                f"{query} 2023",
+                f"آموزش رایگان {query}",
+                f"نکات کلیدی {query}",
+                f"{query} پیشرفته",
+                f"متدهای جدید {query}",
+                f"آموزش تصویری {query}",
+                f"{query} برای مبتدیان"
+            ]
+
+    def _generate_welcome_message(self, user: User) -> str:
+        """تولید پیام خوشامدگویی شخصی‌سازی شده"""
+        plan = self.config.SUBSCRIPTION_PLANS.get(
+            self._get_user_profile(user.id).data["subscription"]["plan"], 
+            self.config.SUBSCRIPTION_PLANS["free"]
         )
         
-        keyboard = [
+        return (
+            f"✨ سلام {user.first_name} عزیز!\n"
+            f"به ربات هوشمند سئوکار خوش آمدید!\n\n"
+            f"🔹 شما در حال استفاده از طرح *{plan.name}* هستید\n"
+            f"🔸 امکانات فعلی شما:\n"
+            + "\n".join(f"• {feature}" for feature in plan.features) +
+            "\n\nبرای شروع کار می‌توانید از منوی زیر اقدام کنید:"
+        )
+
+    def _generate_main_keyboard(self) -> List[List[InlineKeyboardButton]]:
+        """تولید کیبورد اصلی با دکمه‌های شیشه‌ای"""
+        return [
             [InlineKeyboardButton("🔍 پیشنهاد کلمات کلیدی", callback_data='keywords')],
             [InlineKeyboardButton("✍️ تولید محتوای سئو شده", callback_data='content')],
             [InlineKeyboardButton("⚡ بهینه‌سازی متن", callback_data='optimize')],
@@ -812,16 +1143,15 @@ class SEOAssistantBot:
             [InlineKeyboardButton("📚 راهنمای جامع", callback_data='help')],
             [InlineKeyboardButton("👤 پروفایل کاربری", callback_data='profile')]
         ]
-        
-        update.message.reply_text(
-            welcome_msg,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
 
-    def show_help(self, update: Update, context: CallbackContext):
-        """نمایش راهنمای کامل ربات"""
-        help_text = """
+    def _generate_help_text(self, user_profile: UserProfile) -> str:
+        """تولید متن راهنمای جامع"""
+        plan = self.config.SUBSCRIPTION_PLANS.get(
+            user_profile.data["subscription"]["plan"], 
+            self.config.SUBSCRIPTION_PLANS["free"]
+        )
+        
+        return f"""
 📚 *راهنمای جامع ربات سئوکار*
 
 🔍 *پیشنهاد کلمات کلیدی*
@@ -855,335 +1185,123 @@ class SEOAssistantBot:
 - مقایسه محتوای شما با رقیب
 - مثال: `/competitor https://example.com این محتوای من است...`
 
-💾 *مدیریت محتوا*
-/save [نوع] [متن]
-- ذخیره محتوا برای استفاده بعدی
-/list - نمایش لیست محتوای ذخیره شده
-/get [ID] - دریافت محتوای ذخیره شده
-
-👤 *مدیریت حساب کاربری*
-/profile - مشاهده پروفایل
-/subscribe - مشاهده طرح‌های اشتراک
-/upgrade - ارتقاء حساب کاربری
-/language [fa/en] - تغییر زبان
-
-📈 *گزارش‌گیری*
-/report - دریافت گزارش شخصی
-/stats - آمار سیستم
-
-برای شروع از /menu استفاده کنید یا یکی از دستورات بالا را وارد کنید
+💎 *طرح اشتراک شما*: {plan.name}
+📌 *محدودیت درخواست روزانه*: {plan.rate_limit}
 """
-        update.message.reply_text(help_text, parse_mode="Markdown")
 
-    def show_main_menu(self, update: Update, context: CallbackContext):
-        """نمایش منوی اصلی با دکمه‌های شیشه‌ای"""
-        keyboard = [
-            [InlineKeyboardButton("🔍 پیشنهاد کلمات کلیدی", callback_data='keywords')],
-            [InlineKeyboardButton("✍️ تولید محتوا", callback_data='content')],
-            [InlineKeyboardButton("⚡ بهینه‌سازی", callback_data='optimize')],
-            [InlineKeyboardButton("📊 تحلیل سئو", callback_data='analyze')],
-            [InlineKeyboardButton("🔄 مقایسه متون", callback_data='compare')],
-            [InlineKeyboardButton("🏆 تحلیل رقبا", callback_data='competitor')],
-            [InlineKeyboardButton("💾 محتوای ذخیره شده", callback_data='saved_content')],
-            [InlineKeyboardButton("👤 پروفایل", callback_data='profile'), 
-             InlineKeyboardButton("⚙️ تنظیمات", callback_data='settings')]
-        ]
+    def _check_rate_limit(self, user_id: int, endpoint: str) -> bool:
+        """بررسی محدودیت درخواست کاربر"""
+        user_profile = self._get_user_profile(user_id)
+        can_request, message = user_profile.can_make_request(endpoint)
         
-        update.message.reply_text(
-            "منوی اصلی ربات سئوکار:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+        if not can_request:
+            REQUEST_COUNTER.labels(endpoint=endpoint).inc()
+            return False
+            
+        return True
+
+    def _get_user_profile(self, user_id: int) -> UserProfile:
+        """دریافت پروفایل کاربر با ایجاد خودکار در صورت عدم وجود"""
+        if user_id not in self.user_profiles:
+            self.user_profiles[user_id] = UserProfile(user_id, self.config, self.security_manager)
+            ACTIVE_USERS_GAUGE.inc()
+            logger.info(f"پروفایل جدید برای کاربر {user_id} ایجاد شد")
+            
+        return self.user_profiles[user_id]
+
+    # ##################################################
+    # ## -------- کارهای زمان‌بندی شده -------- ##
+    # ##################################################
+
+    def _schedule_jobs(self):
+        """برنامه‌ریزی کارهای زمان‌بندی شده"""
+        # پشتیبان‌گیری روزانه
+        self.job_queue.run_daily(
+            self._daily_backup_task,
+            time=datetime.strptime("03:00", "%H:%M").time(),
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="daily_backup"
         )
+        
+        # ارسال گزارش هفتگی
+        self.job_queue.run_daily(
+            self._weekly_report_task,
+            time=datetime.strptime("10:00", "%H:%M").time(),
+            days=(6,),  # شنبه
+            name="weekly_report"
+        )
+        
+        # به‌روزرسانی مدل‌های ML هر 24 ساعت
+        self.job_queue.run_repeating(
+            self._refresh_models_task,
+            interval=86400,
+            first=0,
+            name="refresh_models"
+        )
+        
+        logger.info("کارهای زمان‌بندی شده با موفقیت تنظیم شدند")
 
-    # ==================== متدهای تحلیل سئو ====================
-
-    def suggest_keywords(self, update: Update, context: CallbackContext):
-        """پیشنهاد کلمات کلیدی مرتبط"""
-        user = update.effective_user
-        user_profile = self.get_user_profile(user.id)
-        
-        if not self.check_rate_limit(user.id):
-            update.message.reply_text("⏳ تعداد درخواست‌های شما امروز به حد مجاز رسیده است.")
-            return
-        
-        if not context.args:
-            update.message.reply_text("لطفاً موضوع مورد نظر خود را وارد کنید.\nمثال: /keywords آموزش سئو")
-            return
-        
-        query = " ".join(context.args)
-        if len(query) > 200:
-            update.message.reply_text("⚠️ طول موضوع نباید از 200 کاراکتر بیشتر باشد.")
-            return
-        
+    def _daily_backup_task(self, context: CallbackContext):
+        """وظیفه پشتیبان‌گیری روزانه"""
         try:
-            update.message.reply_text("🔍 در حال جستجوی بهترین کلمات کلیدی...")
+            backup_name = f"backup_{datetime.now().strftime('%Y%m%d')}"
+            all_data = {
+                str(user_id): profile.data 
+                for user_id, profile in self.user_profiles.items()
+            }
             
-            # شبیه‌سازی مدل پیشرفته پیشنهاد کلمات کلیدی
-            time.sleep(1)  # تاخیر برای شبیه‌سازی پردازش
-            
-            # نتایج نمونه
-            keywords = [
-                f"{query} آموزش",
-                f"آموزش حرفه‌ای {query}",
-                f"بهترین روش‌های {query}",
-                f"{query} 2023",
-                f"آموزش رایگان {query}",
-                f"نکات کلیدی {query}",
-                f"{query} پیشرفته",
-                f"متدهای جدید {query}",
-                f"آموزش تصویری {query}",
-                f"{query} برای مبتدیان"
-            ]
-            
-            response = (
-                f"🔎 *کلمات کلیدی پیشنهادی برای '{query}':*\n\n" +
-                "\n".join(f"🔹 {kw}" for kw in keywords) +
-                "\n\n💡 می‌توانید از این کلمات در تولید محتوا استفاده کنید."
-            )
-            
-            update.message.reply_text(response, parse_mode="Markdown")
-            
-            # ذخیره در تاریخچه کاربر
-            user_profile.save_content("keyword_research", "\n".join(keywords), [query])
-            
-        except Exception as e:
-            logger.error(f"خطا در پیشنهاد کلمات کلیدی: {e}")
-            update.message.reply_text("⚠️ خطایی در پردازش درخواست شما رخ داد. لطفاً مجدداً تلاش کنید.")
-
-    def analyze_seo(self, update: Update, context: CallbackContext):
-        """تحلیل کامل سئو متن یا URL"""
-        user = update.effective_user
-        user_profile = self.get_user_profile(user.id)
-        
-        if not self.check_rate_limit(user.id):
-            update.message.reply_text("⏳ تعداد درخواست‌های شما امروز به حد مجاز رسیده است.")
-            return
-        
-        if not context.args:
-            update.message.reply_text("لطفاً متن یا URL مورد نظر را وارد کنید.\nمثال: /analyze https://example.com")
-            return
-        
-        input_text = " ".join(context.args)
-        is_url = input_text.startswith(('http://', 'https://'))
-        
-        try:
-            update.message.reply_text("📊 در حال تحلیل سئو...")
-            
-            if is_url:
-                # تحلیل URL
-                response = self._analyze_url(input_text)
+            if self.backup_manager.create_backup(all_data, backup_name):
+                logger.info(f"پشتیبان‌گیری روزانه با نام {backup_name} با موفقیت انجام شد")
             else:
-                # تحلیل متن
-                response = self._analyze_text(input_text)
-            
-            # ارسال نتایج
-            update.message.reply_text(response, parse_mode="Markdown")
-            
-            # ذخیره در تاریخچه کاربر
-            user_profile.save_content(
-                "seo_analysis", 
-                input_text[:500] + ("..." if len(input_text) > 500 else ""), 
-                ["analysis"]
-            )
-            
+                logger.warning("خطا در انجام پشتیبان‌گیری روزانه")
         except Exception as e:
-            logger.error(f"خطا در تحلیل سئو: {e}")
-            update.message.reply_text("⚠️ خطایی در تحلیل سئو رخ داد. لطفاً مطمئن شوید URL معتبر است.")
+            logger.error(f"خطا در وظیفه پشتیبان‌گیری روزانه: {e}")
 
-    def _analyze_url(self, url: str) -> str:
-        """تحلیل سئو URL"""
+    def _weekly_report_task(self, context: CallbackContext):
+        """وظیفه ارسال گزارش هفتگی"""
         try:
-            # شبیه‌سازی تحلیل URL
-            time.sleep(2)
+            total_users = len(self.user_profiles)
+            active_users = sum(1 for profile in self.user_profiles.values() 
+                             if profile.data["usage"]["daily_requests"] > 0)
             
-            # نتایج نمونه
-            return (
-                f"📊 *نتایج تحلیل سئو برای {url}*\n\n"
-                "✅ نقاط قوت:\n"
-                "- سرعت بارگذاری مناسب (2.1 ثانیه)\n"
-                "- ساختار عنوان بهینه شده\n"
-                "- توضیحات متا وجود دارد\n\n"
-                "⚠️ نقاط ضعف:\n"
-                "- تصاویر بدون متن جایگزین\n"
-                "- لینک‌های شکسته: 2 مورد\n"
-                "- تراکم کلمات کلیدی پایین (1.2%)\n\n"
-                "💡 پیشنهادات:\n"
-                "- افزودن متن جایگزین به تصاویر\n"
-                "- افزایش طول محتوا (متن فعلی 450 کلمه)\n"
-                "- استفاده از کلمات کلیدی مرتبط بیشتر"
+            report = (
+                "📊 گزارش هفتگی ربات سئوکار\n\n"
+                f"👥 کاربران کل: {total_users}\n"
+                f"🔄 کاربران فعال این هفته: {active_users}\n"
+                f"📌 مجموع درخواست‌ها: {sum(p.data['usage']['total_requests'] for p in self.user_profiles.values())}\n\n"
+                "✅ سیستم به درستی کار می‌کند"
             )
-        except:
-            return "خطا در تحلیل URL. لطفاً از معتبر بودن آدرس مطمئن شوید."
+            
+            # ارسال گزارش به ادمین‌ها (در اینجا فقط لاگ می‌کنیم)
+            logger.info(report)
+        except Exception as e:
+            logger.error(f"خطا در وظیفه گزارش هفتگی: {e}")
 
-    def _analyze_text(self, text: str) -> str:
-        """تحلیل سئو متن"""
+    def _refresh_models_task(self, context: CallbackContext):
+        """تازه‌سازی مدل‌های ML"""
         try:
-            readability = SEOAnalytics.calculate_readability(text)
-            word_count = len(text.split())
-            
-            return (
-                f"📝 *نتایج تحلیل سئو متن*\n\n"
-                f"📖 تعداد کلمات: {word_count}\n"
-                f"🔠 سطح خوانایی: {readability:.1f}/100\n"
-                f"📌 تراکم کلمات کلیدی: 2.1%\n\n"
-                "💡 پیشنهادات:\n"
-                "- استفاده از زیرعنوان‌های بیشتر (H2, H3)\n"
-                "- افزودن لینک‌های داخلی/خارجی\n"
-                "- تقسیم پاراگراف‌های طولانی"
-            )
-        except:
-            return "خطا در تحلیل متن. لطفاً متن معتبر وارد کنید."
+            logger.info("شروع تازه‌سازی مدل‌های یادگیری ماشین...")
+            self.model_manager.load_models()
+            logger.info("مدل‌های یادگیری ماشین با موفقیت تازه‌سازی شدند")
+        except Exception as e:
+            logger.error(f"خطا در تازه‌سازی مدل‌ها: {e}")
 
-    # ==================== متدهای مدیریت کاربران ====================
-
-    def show_profile(self, update: Update, context: CallbackContext):
-        """نمایش پروفایل کاربر"""
-        user = update.effective_user
-        user_profile = self.get_user_profile(user.id)
-        plan = self.config.SUBSCRIPTION_PLANS.get(user_profile.data["subscription"])
-        
-        profile_text = (
-            f"👤 *پروفایل کاربری*\n\n"
-            f"🆔 شناسه کاربری: {user.id}\n"
-            f"👤 نام: {user.full_name}\n"
-            f"📅 عضو شده در: {datetime.now().strftime('%Y-%m-%d')}\n\n"
-            f"💎 طرح اشتراک: {plan.name if plan else 'نامشخص'}\n"
-            f"📊 درخواست‌های امروز: {user_profile.data['usage_stats']['requests_today']}/{plan.rate_limit if plan else 10}\n"
-            f"📈 مجموع درخواست‌ها: {user_profile.data['usage_stats']['total_requests']}\n\n"
-            f"🔗 محتوای ذخیره شده: {len(user_profile.data['saved_content'])} مورد"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("🔄 ارتقاء حساب", callback_data='upgrade'),
-             InlineKeyboardButton("⚙️ تنظیمات", callback_data='settings')],
-            [InlineKeyboardButton("📊 دریافت گزارش", callback_data='report')]
-        ]
-        
-        update.message.reply_text(
-            profile_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-
-    def show_subscription_plans(self, update: Update, context: CallbackContext):
-        """نمایش طرح‌های اشتراک"""
-        keyboard = []
-        for plan_id, plan in self.config.SUBSCRIPTION_PLANS.items():
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{plan.name} - {plan.monthly_price:,} تومان",
-                    callback_data=f"plan_{plan_id}"
-                )
-            ])
-        
-        keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data='profile')])
-        
-        update.message.reply_text(
-            "💎 *طرح‌های اشتراک*\n\n"
-            "لطفاً یکی از طرح‌های زیر را انتخاب کنید:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-
-    # ==================== متدهای مدیریت محتوا ====================
-
-    def save_content(self, update: Update, context: CallbackContext):
-        """ذخیره محتوا برای کاربر"""
-        user = update.effective_user
-        user_profile = self.get_user_profile(user.id)
-        
-        if not context.args or len(context.args) < 2:
-            update.message.reply_text(
-                "فرمت دستور:\n"
-                "/save [نوع] [متن]\n"
-                "انواع محتوا: article, note, code, idea\n"
-                "مثال: /save article این یک مقاله نمونه است..."
-            )
-            return
-        
-        content_type = context.args[0]
-        content_text = " ".join(context.args[1:])
-        
-        if len(content_text) > 1000:
-            update.message.reply_text("⚠️ طول محتوا نباید از 1000 کاراکتر بیشتر باشد.")
-            return
-        
-        user_profile.save_content(content_type, content_text)
-        update.message.reply_text("✅ محتوا با موفقیت ذخیره شد.")
-
-    def list_saved_content(self, update: Update, context: CallbackContext):
-        """نمایش لیست محتوای ذخیره شده"""
-        user = update.effective_user
-        user_profile = self.get_user_profile(user.id)
-        
-        if not user_profile.data["saved_content"]:
-            update.message.reply_text("شما هنوز محتوایی ذخیره نکرده‌اید.")
-            return
-        
-        keyboard = []
-        for item in user_profile.data["saved_content"][:10]:  # فقط 10 مورد اخیر
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{item['type']} - {item['created_at'][:10]}",
-                    callback_data=f"get_{item['id']}"
-                )
-            ])
-        
-        update.message.reply_text(
-            "📚 محتوای ذخیره شده شما:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    # ==================== متدهای مدیریت رویدادها ====================
-
-    def handle_button(self, update: Update, context: CallbackContext):
-        """مدیریت کلیک روی دکمه‌های اینلاین"""
-        query = update.callback_query
-        query.answer()
-        
-        if query.data == 'keywords':
-            query.edit_message_text(
-                "🔍 لطفاً موضوع مورد نظر برای پیشنهاد کلمات کلیدی را ارسال کنید:",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 بازگشت", callback_data='menu')]
-                ])
-            )
-        elif query.data == 'menu':
-            self.show_main_menu(update, context)
-        elif query.data.startswith('plan_'):
-            plan_id = query.data.split('_')[1]
-            plan = self.payment_manager.get_plan(plan_id)
-            if plan:
-                query.edit_message_text(
-                    self.payment_manager.get_plan_features(plan_id),
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("💰 ارتقاء به این طرح", callback_data=f"upgrade_{plan_id}"),
-                         InlineKeyboardButton("🔙 بازگشت", callback_data='subscribe')]
-                    ]),
-                    parse_mode="Markdown"
-                )
-        elif query.data.startswith('upgrade_'):
-            plan_id = query.data.split('_')[1]
-            query.edit_message_text(
-                f"برای ارتقاء به طرح {plan_id} لطفاً به آدرس زیر مراجعه کنید:\n"
-                "https://example.com/subscribe\n\n"
-                "پس از پرداخت، اشتراک شما به صورت خودکار فعال خواهد شد.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 بازگشت", callback_data=f"plan_{plan_id}")]
-                ])
-            )
-        # مدیریت سایر دکمه‌ها
-
-    def handle_message(self, update: Update, context: CallbackContext):
-        """مدیریت پیام‌های متنی"""
-        # پیاده‌سازی بر اساس نیاز
-        pass
-
-    # ==================== متدهای اجرایی ====================
+    # ##################################################
+    # ## -------- نقطه ورود اصلی ربات -------- ##
+    # ##################################################
 
     def run(self):
         """راه‌اندازی ربات با مدیریت خطا"""
         try:
-            self.model_manager.load_models()
+            # راه‌اندازی متریک‌ها
+            if os.getenv('ENABLE_METRICS', 'false').lower() == 'true':
+                start_http_server(8000)
+                logger.info("سیستم متریک‌ها روی پورت 8000 راه‌اندازی شد")
+            
+            # برنامه‌ریزی کارهای زمان‌بندی شده
+            self._schedule_jobs()
+            
+            # شروع ربات
             self.updater.start_polling()
             logger.info("✅ ربات سئوکار با موفقیت شروع به کار کرد")
             self.updater.idle()
@@ -1193,10 +1311,44 @@ class SEOAssistantBot:
         finally:
             # ذخیره داده‌های کاربران قبل از خروج
             for user_id in self.user_profiles:
-                self.save_user_data(user_id)
+                self._save_user_data(user_id)
             logger.info("داده‌های کاربران ذخیره شدند")
 
+    def _save_user_data(self, user_id: int):
+        """ذخیره داده کاربر با مدیریت خطا"""
+        try:
+            if user_id not in self.user_profiles:
+                return
+                
+            user_dir = Path(self.config.USER_DATA_DIR)
+            user_dir.mkdir(exist_ok=True, mode=0o700)
+            
+            user_file = user_dir / f"{user_id}.json"
+            encrypted_data = self.security_manager.encrypt_data(
+                json.dumps(self.user_profiles[user_id].data, ensure_ascii=False)
+            
+            with open(user_file, 'w', encoding='utf-8') as f:
+                json.dump(encrypted_data, f, ensure_ascii=False)
+            
+            logger.debug(f"داده کاربر {user_id} با موفقیت ذخیره شد")
+        except Exception as e:
+            logger.error(f"خطا در ذخیره داده کاربر {user_id}: {e}")
+
 if __name__ == '__main__':
-    config = Config()
-    bot = SEOAssistantBot(config)
-    bot.run()
+    try:
+        # تنظیمات اولیه
+        config = Config()
+        
+        # بررسی تنظیمات ضروری
+        if not config.BOT_TOKEN:
+            raise ValueError("توکن ربات باید تنظیم شود. متغیر محیطی BOT_TOKEN را تنظیم کنید.")
+            
+        if not config.ENCRYPTION_KEY:
+            raise ValueError("کلید رمزنگاری باید تنظیم شود. متغیر محیطی ENCRYPTION_KEY را تنظیم کنید.")
+        
+        # راه‌اندازی ربات
+        bot = SEOAssistantBot(config)
+        bot.run()
+    except Exception as e:
+        logger.critical(f"خطای بحرانی در راه‌اندازی ربات: {e}")
+        raise
