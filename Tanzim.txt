@@ -1,0 +1,115 @@
+sudo apt update && sudo apt upgrade -y
+sudo apt install python3-pip git -y
+pip3 install --upgrade pip
+
+
+
+pip3 install torch torchvision torchaudio transformers accelerate
+
+
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+models = [
+    "mistralai/Mistral-7B",
+    "facebook/bart-large-cnn",
+    "nlptown/bert-base-multilingual-uncased-sentiment",
+    "deepset/roberta-base-squad2"
+]
+
+for model_name in models:
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    print(f"{model_name} دانلود و کش شد.")
+
+pip3 install fastapi uvicorn
+
+
+from fastapi import FastAPI
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+app = FastAPI()
+
+# لود مدل‌ها
+models = {
+    "content_generation": "mistralai/Mistral-7B",
+    "summarization": "facebook/bart-large-cnn",
+    "sentiment": "nlptown/bert-base-multilingual-uncased-sentiment",
+    "faq": "deepset/roberta-base-squad2"
+}
+
+loaded_models = {}
+tokenizers = {}
+
+for key, model_name in models.items():
+    tokenizers[key] = AutoTokenizer.from_pretrained(model_name)
+    loaded_models[key] = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+@app.get("/")
+def read_root():
+    return {"message": "SEO Bot API is running"}
+
+@app.post("/generate/")
+def generate_text(prompt: str):
+    tokenizer = tokenizers["content_generation"]
+    model = loaded_models["content_generation"]
+    inputs = tokenizer(prompt, return_tensors="pt")
+    outputs = model.generate(**inputs)
+    return {"response": tokenizer.decode(outputs[0], skip_special_tokens=True)}
+
+# اجرای API
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+import torch
+model = loaded_models["content_generation"]
+scripted_model = torch.jit.script(model)
+scripted_model.save("mistral-7B-scripted.pt")
+
+
+
+
+python3 app.py
+
+FROM python:3.9
+
+WORKDIR /app
+COPY . /app
+
+RUN pip install --no-cache-dir fastapi uvicorn torch torchvision torchaudio transformers accelerate
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+docker build -t seo-bot-api .
+docker run -p 8000:8000 seo-bot-api
+
+
+pip install accelerate
+accelerate config
+
+
+from accelerate import infer_auto_device_map
+device_map = infer_auto_device_map(loaded_models["content_generation"])
+loaded_models["content_generation"].to(device_map)
+
+
+
+
+sudo apt install nginx
+
+
+
+server {
+    listen 80;
+    location / {
+        proxy_pass http://127.0.0.1:8000/;
+    }
+}
+
+
+
+
+sudo ln -s /etc/nginx/sites-available/seo-bot /etc/nginx/sites-enabled/
+sudo systemctl restart nginx
+
+
